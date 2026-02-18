@@ -131,12 +131,6 @@ def set_index_message_id(message_id: int):
 # ÍNDICE
 # ══════════════════════════════════════════════
 
-def escape_md(text: str) -> str:
-    """Escapa todos los caracteres reservados de MarkdownV2."""
-    reserved = r'\_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(reserved)}])', r'\\\1', text)
-
-
 def build_index_text() -> str:
     stories = get_all_published()
     if not stories:
@@ -144,9 +138,9 @@ def build_index_text() -> str:
 
     lines = ["📚 *Índice de Relatos*\n"]
     for i, story in enumerate(stories, 1):
-        title = escape_md(story.get("title", "Sin título"))
+        title = story.get("title", "Sin título").replace("[", "\\[").replace("]", "\\]").replace("(", "\\(").replace(")", "\\)").replace(".", "\\.").replace("!", "\\!").replace("-", "\\-")
         url = story.get("telegraph_url", "")
-        pub_date = escape_md(story.get("pub_date", ""))
+        pub_date = story.get("pub_date", "").replace(".", "\\.").replace("-", "\\-").replace("/", "\\/")
         date_str = f" _\\({pub_date}\\)_" if pub_date else ""
         if url:
             lines.append(f"{i}\\. [{title}]({url}){date_str}")
@@ -160,8 +154,9 @@ def build_index_text() -> str:
 async def update_index(bot):
     try:
         text = build_index_text()
+        # Telegram limita mensajes a 4096 caracteres
         if len(text) > 4096:
-            text = text[:4090] + "\n\\.\\.\\."
+            text = text[:4090] + "\n..."
         message_id = get_index_message_id()
 
         if message_id:
@@ -170,7 +165,7 @@ async def update_index(bot):
                     chat_id=CHAT_ID,
                     message_id=message_id,
                     text=text,
-                    parse_mode="MarkdownV2",
+                    parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
                 logger.info("Índice actualizado.")
@@ -181,7 +176,7 @@ async def update_index(bot):
         msg = await bot.send_message(
             chat_id=CHAT_ID,
             text=text,
-            parse_mode="MarkdownV2",
+            parse_mode="Markdown",
             disable_web_page_preview=True,
         )
         set_index_message_id(msg.message_id)
@@ -504,7 +499,7 @@ def main():
     )
 
     logger.info(f"Bot iniciado. Revisando cada {INTERVAL_HOURS} horas.")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling()
 
 
 if __name__ == "__main__":
