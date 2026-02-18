@@ -21,7 +21,8 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID          = os.environ["CHAT_ID"]
 TELEGRAPH_AUTHOR = os.getenv("TELEGRAPH_AUTHOR", "Mi Canal")
 BASE_URL         = "https://sexosintabues30.com/category/relatos-eroticos/gays/"
-INTERVAL_HOURS   = int(os.getenv("INTERVAL_HOURS", "6"))
+INTERVAL_HOURS   = int(os.getenv("INTERVAL_HOURS", "12"))
+MAX_PAGES        = 10
 PUBLISHED_FILE   = "published.json"
 # ─────────────────────────────────────────────
 
@@ -39,7 +40,6 @@ HEADERS = {
     )
 }
 
-# Palabras que indican que el enlace NO es un relato
 SKIP_TITLES = {
     "leer más", "leer mas", "comentarios", "comentario",
     "0 comentarios", "1 comentario", "sin comentarios",
@@ -66,51 +66,77 @@ def save_published(published: set):
 # SCRAPING
 # ══════════════════════════════════════════════
 
-def get_story_links(page_url: str) -> list:
-    """Obtiene solo los enlaces reales a relatos (no menús ni botones)."""
+def get_story_links_from_page(page_url: str, domain: str) -> list:
+    """Obtiene relatos válidos de una página."""
     try:
         resp = requests.get(page_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
     except Exception as e:
-        logger.error(f"Error al acceder a la lista: {e}")
+        logger.error(f"Error al acceder a {page_url}: {e}")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
     stories = []
     seen_urls = set()
-    domain = BASE_URL.split("/")[2]
 
-    # Buscamos solo enlaces dentro de títulos de artículos
     for tag in soup.select("h1 a, h2 a, h3 a, .entry-title a, .post-title a"):
-        href = a_href = tag.get("href", "").strip()
+        href = tag.get("href", "").strip()
         title = tag.get_text(strip=True)
 
-        # Filtros de limpieza
         if not href or not title:
             continue
         if domain not in href:
             continue
         if href in seen_urls:
             continue
-        if len(title) < 8:  # títulos muy cortos son basura (autores, números)
+        if len(title) < 8:
             continue
         if title.lower() in SKIP_TITLES:
             continue
         if re.match(r"^\d+\s+comentario", title.lower()):
             continue
-        # Evitar URLs de categorías (no son relatos individuales)
-        if "/category/" in href:
+        if "/category/" in href or "/page/" in href:
             continue
 
         seen_urls.add(href)
         stories.append({"title": title, "url": href})
 
-    logger.info(f"Encontrados {len(stories)} relatos válidos.")
     return stories
 
 
+def get_all_story_links() -> list:
+    """Recorre hasta MAX_PAGES páginas y devuelve todos los relatos únicos."""
+    domain = BASE_URL.split("/")[2]
+    all_stories = []
+    seen_urls = set()
+
+    for page_num in range(1, MAX_PAGES + 1):
+        if page_num == 1:
+            page_url = BASE_URL
+        else:
+            page_url = f"{BASE_URL}page/{page_num}/"
+
+        logger.info(f"Revisando página {page_num}: {page_url}")
+        stories = get_story_links_from_page(page_url, domain)
+
+        if not stories:
+            logger.info(f"Página {page_num} vacía o no existe. Deteniendo.")
+            break
+
+        for story in stories:
+            if story["url"] not in seen_urls:
+                seen_urls.add(story["url"])
+                all_stories.append(story)
+
+        await_seconds = 1  # pausa entre páginas para no saturar el servidor
+        import time; time.sleep(await_seconds)
+
+    logger.info(f"Total relatos encontrados: {len(all_stories)}")
+    return all_stories
+
+
 def clean_html_for_telegraph(html: str) -> str:
-    """Convierte HTML a formato compatible con Telegraph (sin divs)."""
+    """Convierte HTML a formato compatible con Telegraph."""
     soup = BeautifulSoup(html, "html.parser")
 
     # Eliminar elementos no deseados
@@ -121,18 +147,17 @@ def clean_html_for_telegraph(html: str) -> str:
     for div in soup.find_all("div"):
         div.name = "p"
 
-    # Convertir span a texto plano
+    # Quitar spans manteniendo contenido
     for span in soup.find_all("span"):
         span.unwrap()
 
-    # Limpiar atributos innecesarios (Telegraph solo permite ciertos)
+    # Solo etiquetas permitidas por Telegraph
     allowed_tags = {"p", "br", "strong", "em", "b", "i", "a", "ul", "ol", "li",
                     "h3", "h4", "blockquote", "figure", "figcaption", "img"}
     for tag in soup.find_all(True):
         if tag.name not in allowed_tags:
             tag.unwrap()
         else:
-            # Solo conservar atributo href en <a> y src en <img>
             attrs = {}
             if tag.name == "a" and tag.get("href"):
                 attrs["href"] = tag["href"]
@@ -140,13 +165,18 @@ def clean_html_for_telegraph(html: str) -> str:
                 attrs["src"] = tag["src"]
             tag.attrs = attrs
 
-    return str(soup)
+    # Normalizar caracteres especiales
+    text = str(soup)
+    text = text.encode("utf-8").decode("utf-8")
+
+    return text
 
 
 def get_story_content(story_url: str) -> str:
     try:
         resp = requests.get(story_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
+        resp.encoding = "utf-8"
     except Exception as e:
         logger.error(f"Error al descargar relato {story_url}: {e}")
         return ""
@@ -193,13 +223,14 @@ def publish_to_telegraph(title: str, html_content: str) -> str:
 async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Iniciando revisión del sitio...")
     published = load_published()
-    stories = get_story_links(BASE_URL)
+    stories = get_all_story_links()
     new_count = 0
 
     for story in stories:
         url = story["url"]
         title = story["title"]
 
+        # No repetir relatos ya publicados
         if url in published:
             continue
 
@@ -241,6 +272,7 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Bot activo.\n\n"
         f"⏰ Reviso nuevos relatos cada *{INTERVAL_HOURS} horas*.\n"
+        f"📄 Reviso hasta *{MAX_PAGES} páginas* por ciclo.\n"
         "📌 Comandos:\n"
         "• /check — revisar ahora\n"
         "• /status — relatos publicados",
