@@ -113,8 +113,8 @@ def build_index_text() -> str:
 
     lines = ["📚 *Índice de Relatos*\n"]
     for i, story in enumerate(stories, 1):
-        title = story["title"]
-        url = story["telegraph_url"]
+        title = story.get("title", "Sin título")
+        url = story.get("telegraph_url", "")
         pub_date = story.get("pub_date", "")
         date_str = f" _({pub_date})_" if pub_date else ""
         lines.append(f"{i}\\. [{title}]({url}){date_str}")
@@ -329,7 +329,7 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
 
     for story in stories:
         url = story["url"]
-        title = story["title"]
+        title = story.get("title", "Sin título")
 
         if is_published(url):
             continue
