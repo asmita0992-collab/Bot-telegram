@@ -1,10 +1,10 @@
 """
 Bot de Telegram que scrape relatos y los publica en Telegraph automáticamente.
+Usa MongoDB Atlas para persistencia entre reinicios.
 """
 
 import asyncio
 import logging
-import json
 import os
 import re
 from datetime import datetime
@@ -13,17 +13,18 @@ import requests
 from bs4 import BeautifulSoup
 from telegraph import Telegraph
 from telegram.ext import Application, CommandHandler, ContextTypes
+from pymongo import MongoClient
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN — se leen desde variables de entorno
 # ─────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID          = os.environ["CHAT_ID"]
+MONGO_URI        = os.environ["MONGO_URI"]
 TELEGRAPH_AUTHOR = os.getenv("TELEGRAPH_AUTHOR", "Mi Canal")
 BASE_URL         = "https://sexosintabues30.com/category/relatos-eroticos/gays/"
 INTERVAL_HOURS   = int(os.getenv("INTERVAL_HOURS", "12"))
 MAX_PAGES        = 10
-PUBLISHED_FILE   = "published.json"
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -45,21 +46,34 @@ SKIP_TITLES = {
     "0 comentarios", "1 comentario", "sin comentarios",
 }
 
-
 # ══════════════════════════════════════════════
-# PERSISTENCIA
+# MONGODB
 # ══════════════════════════════════════════════
 
-def load_published() -> set:
-    if os.path.exists(PUBLISHED_FILE):
-        with open(PUBLISHED_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+_db = None
 
+def get_db():
+    global _db
+    if _db is None:
+        client = MongoClient(MONGO_URI)
+        _db = client["relatos_bot"]
+    return _db
 
-def save_published(published: set):
-    with open(PUBLISHED_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(published), f, ensure_ascii=False, indent=2)
+def is_published(url: str) -> bool:
+    db = get_db()
+    return db.published.find_one({"url": url}) is not None
+
+def mark_published(url: str, title: str):
+    db = get_db()
+    db.published.update_one(
+        {"url": url},
+        {"$set": {"url": url, "title": title, "date": datetime.now()}},
+        upsert=True,
+    )
+
+def count_published() -> int:
+    db = get_db()
+    return db.published.count_documents({})
 
 
 # ══════════════════════════════════════════════
@@ -67,7 +81,6 @@ def save_published(published: set):
 # ══════════════════════════════════════════════
 
 def get_story_links_from_page(page_url: str, domain: str) -> list:
-    """Obtiene relatos válidos de una página."""
     try:
         resp = requests.get(page_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -105,22 +118,17 @@ def get_story_links_from_page(page_url: str, domain: str) -> list:
 
 
 def get_all_story_links() -> list:
-    """Recorre hasta MAX_PAGES páginas y devuelve todos los relatos únicos."""
     domain = BASE_URL.split("/")[2]
     all_stories = []
     seen_urls = set()
 
     for page_num in range(1, MAX_PAGES + 1):
-        if page_num == 1:
-            page_url = BASE_URL
-        else:
-            page_url = f"{BASE_URL}page/{page_num}/"
-
+        page_url = BASE_URL if page_num == 1 else f"{BASE_URL}page/{page_num}/"
         logger.info(f"Revisando página {page_num}: {page_url}")
         stories = get_story_links_from_page(page_url, domain)
 
         if not stories:
-            logger.info(f"Página {page_num} vacía o no existe. Deteniendo.")
+            logger.info(f"Página {page_num} vacía. Deteniendo.")
             break
 
         for story in stories:
@@ -128,30 +136,24 @@ def get_all_story_links() -> list:
                 seen_urls.add(story["url"])
                 all_stories.append(story)
 
-        await_seconds = 1  # pausa entre páginas para no saturar el servidor
-        import time; time.sleep(await_seconds)
+        import time; time.sleep(1)
 
     logger.info(f"Total relatos encontrados: {len(all_stories)}")
     return all_stories
 
 
 def clean_html_for_telegraph(html: str) -> str:
-    """Convierte HTML a formato compatible con Telegraph."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Eliminar elementos no deseados
     for tag in soup.select("script, style, .sharedaddy, .jp-relatedposts, ins, iframe, form, nav"):
         tag.decompose()
 
-    # Convertir divs a párrafos
     for div in soup.find_all("div"):
         div.name = "p"
 
-    # Quitar spans manteniendo contenido
     for span in soup.find_all("span"):
         span.unwrap()
 
-    # Solo etiquetas permitidas por Telegraph
     allowed_tags = {"p", "br", "strong", "em", "b", "i", "a", "ul", "ol", "li",
                     "h3", "h4", "blockquote", "figure", "figcaption", "img"}
     for tag in soup.find_all(True):
@@ -165,11 +167,7 @@ def clean_html_for_telegraph(html: str) -> str:
                 attrs["src"] = tag["src"]
             tag.attrs = attrs
 
-    # Normalizar caracteres especiales
-    text = str(soup)
-    text = text.encode("utf-8").decode("utf-8")
-
-    return text
+    return str(soup).encode("utf-8").decode("utf-8")
 
 
 def get_story_content(story_url: str) -> str:
@@ -222,7 +220,6 @@ def publish_to_telegraph(title: str, html_content: str) -> str:
 
 async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Iniciando revisión del sitio...")
-    published = load_published()
     stories = get_all_story_links()
     new_count = 0
 
@@ -230,8 +227,7 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
         url = story["url"]
         title = story["title"]
 
-        # No repetir relatos ya publicados
-        if url in published:
+        if is_published(url):
             continue
 
         logger.info(f"Nuevo relato: {title}")
@@ -241,8 +237,7 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             telegraph_url = publish_to_telegraph(title, content)
-            published.add(url)
-            save_published(published)
+            mark_published(url, title)
             new_count += 1
 
             message = (
@@ -286,9 +281,9 @@ async def cmd_check(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
-    published = load_published()
+    total = count_published()
     await update.message.reply_text(
-        f"📊 Relatos publicados: *{len(published)}*",
+        f"📊 Relatos publicados: *{total}*",
         parse_mode="Markdown",
     )
 
