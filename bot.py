@@ -6,8 +6,6 @@ import asyncio
 import logging
 import json
 import os
-import re
-import time
 from datetime import datetime
 
 import requests
@@ -15,17 +13,16 @@ from bs4 import BeautifulSoup
 from telegraph import Telegraph
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN — se leen desde variables de entorno
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]   # define en Koyeb
-CHAT_ID          = os.environ["CHAT_ID"]          # define en Koyeb
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID          = os.environ["CHAT_ID"]
 TELEGRAPH_AUTHOR = os.getenv("TELEGRAPH_AUTHOR", "Mi Canal")
 BASE_URL         = "https://sexosintabues30.com/relatos-eroticos/dominacion-hombres/"
-INTERVAL_HOURS   = 6                             # Cada cuántas horas revisa el sitio
-PUBLISHED_FILE   = "published.json"             # Archivo para recordar lo ya publicado
+INTERVAL_HOURS   = int(os.getenv("INTERVAL_HOURS", "6"))
+PUBLISHED_FILE   = "published.json"
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -63,8 +60,7 @@ def save_published(published: set):
 # SCRAPING
 # ══════════════════════════════════════════════
 
-def get_story_links(page_url: str) -> list[dict]:
-    """Obtiene lista de relatos (título + URL) desde la página principal."""
+def get_story_links(page_url: str) -> list:
     try:
         resp = requests.get(page_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -75,7 +71,6 @@ def get_story_links(page_url: str) -> list[dict]:
     soup = BeautifulSoup(resp.text, "html.parser")
     stories = []
 
-    # Selector genérico; ajusta si el sitio usa otra estructura
     for a in soup.select("article a, h2 a, h3 a, .entry-title a"):
         href = a.get("href", "")
         title = a.get_text(strip=True)
@@ -88,7 +83,6 @@ def get_story_links(page_url: str) -> list[dict]:
 
 
 def get_story_content(story_url: str) -> str:
-    """Descarga y limpia el contenido HTML de un relato."""
     try:
         resp = requests.get(story_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -98,11 +92,9 @@ def get_story_content(story_url: str) -> str:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Intentamos varios selectores comunes para el contenido
     for selector in [".entry-content", ".post-content", "article .content", "article"]:
         content = soup.select_one(selector)
         if content:
-            # Limpiamos scripts, estilos y anuncios
             for tag in content.select("script, style, .sharedaddy, .jp-relatedposts, ins"):
                 tag.decompose()
             return str(content)
@@ -126,7 +118,6 @@ def get_telegraph() -> Telegraph:
 
 
 def publish_to_telegraph(title: str, html_content: str) -> str:
-    """Publica el relato en Telegraph y devuelve la URL."""
     tph = get_telegraph()
     response = tph.create_page(
         title=title,
@@ -140,19 +131,19 @@ def publish_to_telegraph(title: str, html_content: str) -> str:
 # LÓGICA PRINCIPAL
 # ══════════════════════════════════════════════
 
-async def check_and_publish(bot: Bot):
+async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
     """Revisa el sitio, publica relatos nuevos y notifica en Telegram."""
     logger.info("Iniciando revisión del sitio...")
     published = load_published()
     stories = get_story_links(BASE_URL)
-
     new_count = 0
+
     for story in stories:
         url = story["url"]
         title = story["title"]
 
         if url in published:
-            continue  # ya fue publicado
+            continue
 
         logger.info(f"Nuevo relato encontrado: {title}")
         content = get_story_content(url)
@@ -165,21 +156,17 @@ async def check_and_publish(bot: Bot):
             save_published(published)
             new_count += 1
 
-            # Notificar al canal
             message = (
                 f"📖 *{title}*\n\n"
                 f"🔗 [Leer en Telegraph]({telegraph_url})\n\n"
-                f"_Publicado automáticamente el {datetime.now().strftime('%d/%m/%Y %H:%M')}_"
+                f"_Publicado el {datetime.now().strftime('%d/%m/%Y %H:%M')}_"
             )
-            await bot.send_message(
+            await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=message,
                 parse_mode="Markdown",
-                disable_web_page_preview=False,
             )
             logger.info(f"Publicado: {telegraph_url}")
-
-            # Pausa para no saturar las APIs
             await asyncio.sleep(3)
 
         except Exception as e:
@@ -196,22 +183,22 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Bot activo.\n\n"
         f"⏰ Reviso nuevos relatos cada *{INTERVAL_HOURS} horas*.\n"
-        "📌 Comandos disponibles:\n"
-        "• /check — forzar revisión ahora\n"
-        "• /status — ver cuántos relatos hay publicados",
+        "📌 Comandos:\n"
+        "• /check — revisar ahora\n"
+        "• /status — relatos publicados",
         parse_mode="Markdown",
     )
 
 
 async def cmd_check(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Revisando el sitio ahora mismo...")
-    await check_and_publish(context.bot)
+    await update.message.reply_text("🔍 Revisando ahora...")
+    await check_and_publish(context)
 
 
 async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
     published = load_published()
     await update.message.reply_text(
-        f"📊 Relatos publicados hasta ahora: *{len(published)}*",
+        f"📊 Relatos publicados: *{len(published)}*",
         parse_mode="Markdown",
     )
 
@@ -220,27 +207,24 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
 # ARRANQUE
 # ══════════════════════════════════════════════
 
-async def main():
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Scheduler
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
+    # Scheduler integrado de python-telegram-bot (sin conflictos de event loop)
+    job_queue = app.job_queue
+    job_queue.run_repeating(
         check_and_publish,
-        trigger="interval",
-        hours=INTERVAL_HOURS,
-        args=[app.bot],
-        next_run_time=datetime.now(),  # primera ejecución inmediata
+        interval=INTERVAL_HOURS * 3600,
+        first=10,  # primera ejecución 10 segundos después de arrancar
     )
-    scheduler.start()
 
     logger.info(f"Bot iniciado. Revisando cada {INTERVAL_HOURS} horas.")
-    await app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
