@@ -8,7 +8,9 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 from bs4 import BeautifulSoup
@@ -27,6 +29,7 @@ TELEGRAPH_AUTHOR = os.getenv("TELEGRAPH_AUTHOR", "Mi Canal")
 BASE_URL         = "https://sexosintabues30.com/category/relatos-eroticos/gays/"
 INTERVAL_HOURS   = int(os.getenv("INTERVAL_HOURS", "12"))
 MAX_PAGES        = 10
+MAX_CONTENT_SIZE = 50000  # límite de caracteres por parte
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -47,6 +50,25 @@ SKIP_TITLES = {
     "leer más", "leer mas", "comentarios", "comentario",
     "0 comentarios", "1 comentario", "sin comentarios",
 }
+
+
+# ══════════════════════════════════════════════
+# SERVIDOR HTTP (para health check de Koyeb)
+# ══════════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # silenciar logs del servidor
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Servidor de health check iniciado en puerto 8000.")
 
 
 # ══════════════════════════════════════════════
@@ -86,9 +108,12 @@ def count_published() -> int:
 
 def get_all_published() -> list:
     db = get_db()
-    return list(db.published.find({}, {"_id": 0, "title": 1, "telegraph_url": 1, "pub_date": 1}).sort("date", 1))
+    return list(db.published.find(
+        {},
+        {"_id": 0, "title": 1, "telegraph_url": 1, "pub_date": 1}
+    ).sort("date", 1))
 
-def get_index_message_id() -> int | None:
+def get_index_message_id():
     db = get_db()
     doc = db.config.find_one({"key": "index_message_id"})
     return doc["value"] if doc else None
@@ -109,46 +134,55 @@ def set_index_message_id(message_id: int):
 def build_index_text() -> str:
     stories = get_all_published()
     if not stories:
-        return "📚 *Índice de Relatos*\n\n_Aún no hay relatos publicados._"
+        return "📚 *Índice de Relatos*\n\n_Aún no hay relatos publicados\\._"
 
     lines = ["📚 *Índice de Relatos*\n"]
     for i, story in enumerate(stories, 1):
-        title = story.get("title", "Sin título")
+        title = story.get("title", "Sin título").replace("[", "\\[").replace("]", "\\]").replace("(", "\\(").replace(")", "\\)").replace(".", "\\.").replace("!", "\\!").replace("-", "\\-")
         url = story.get("telegraph_url", "")
-        pub_date = story.get("pub_date", "")
-        date_str = f" _({pub_date})_" if pub_date else ""
-        lines.append(f"{i}\\. [{title}]({url}){date_str}")
+        pub_date = story.get("pub_date", "").replace(".", "\\.").replace("-", "\\-").replace("/", "\\/")
+        date_str = f" _\\({pub_date}\\)_" if pub_date else ""
+        if url:
+            lines.append(f"{i}\\. [{title}]({url}){date_str}")
+        else:
+            lines.append(f"{i}\\. {title}{date_str}")
 
     lines.append(f"\n_Total: {len(stories)} relatos_")
     return "\n".join(lines)
 
 
 async def update_index(bot):
-    text = build_index_text()
-    message_id = get_index_message_id()
+    try:
+        text = build_index_text()
+        # Telegram limita mensajes a 4096 caracteres
+        if len(text) > 4096:
+            text = text[:4090] + "\n\\.\\.\\."
+        message_id = get_index_message_id()
 
-    if message_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=CHAT_ID,
-                message_id=message_id,
-                text=text,
-                parse_mode="MarkdownV2",
-                disable_web_page_preview=True,
-            )
-            logger.info("Índice actualizado.")
-            return
-        except BadRequest as e:
-            logger.warning(f"No se pudo editar el índice: {e}. Creando uno nuevo.")
+        if message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=CHAT_ID,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="MarkdownV2",
+                    disable_web_page_preview=True,
+                )
+                logger.info("Índice actualizado.")
+                return
+            except BadRequest as e:
+                logger.warning(f"No se pudo editar el índice: {e}. Creando uno nuevo.")
 
-    msg = await bot.send_message(
-        chat_id=CHAT_ID,
-        text=text,
-        parse_mode="MarkdownV2",
-        disable_web_page_preview=True,
-    )
-    set_index_message_id(msg.message_id)
-    logger.info(f"Índice creado con message_id={msg.message_id}")
+        msg = await bot.send_message(
+            chat_id=CHAT_ID,
+            text=text,
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+        )
+        set_index_message_id(msg.message_id)
+        logger.info(f"Índice creado con message_id={msg.message_id}")
+    except Exception as e:
+        logger.error(f"Error actualizando índice: {e}")
 
 
 # ══════════════════════════════════════════════
@@ -218,11 +252,8 @@ def get_all_story_links() -> list:
 
 
 def extract_pub_date(soup: BeautifulSoup) -> str:
-    """Extrae la fecha de publicación original del relato."""
-    # Intentar con etiqueta <time>
     time_tag = soup.find("time")
     if time_tag:
-        # Primero intentar el atributo datetime
         dt = time_tag.get("datetime", "")
         if dt:
             try:
@@ -230,12 +261,10 @@ def extract_pub_date(soup: BeautifulSoup) -> str:
                 return d.strftime("%d/%m/%Y")
             except Exception:
                 pass
-        # Si no, usar el texto visible
         text = time_tag.get_text(strip=True)
         if text:
             return text
 
-    # Intentar con clases comunes de WordPress
     for selector in [".entry-date", ".post-date", ".published", ".date", "span.date"]:
         el = soup.select_one(selector)
         if el:
@@ -269,11 +298,12 @@ def clean_html_for_telegraph(html: str) -> str:
                 attrs["src"] = tag["src"]
             tag.attrs = attrs
 
-    return str(soup).encode("utf-8").decode("utf-8")
+    result = str(soup).encode("utf-8").decode("utf-8")
+
+    return result
 
 
-def get_story_content(story_url: str) -> tuple[str, str]:
-    """Retorna (html_content, pub_date)."""
+def get_story_content(story_url: str):
     try:
         resp = requests.get(story_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -308,14 +338,44 @@ def get_telegraph() -> Telegraph:
     return _telegraph
 
 
-def publish_to_telegraph(title: str, html_content: str) -> str:
+def publish_to_telegraph(title: str, html_content: str) -> list:
+    """Publica en Telegraph. Si el contenido es muy largo, lo divide en partes.
+    Retorna lista de URLs (1 o 2 elementos)."""
     tph = get_telegraph()
-    response = tph.create_page(
-        title=title,
-        html_content=html_content,
+
+    if len(html_content) <= MAX_CONTENT_SIZE:
+        response = tph.create_page(
+            title=title,
+            html_content=html_content,
+            author_name=TELEGRAPH_AUTHOR,
+        )
+        return [f"https://telegra.ph/{response['path']}"]
+
+    # Dividir en dos partes por la mitad (respetando párrafos)
+    mid = len(html_content) // 2
+    split_pos = html_content.rfind("</p>", 0, mid)
+    if split_pos == -1:
+        split_pos = mid
+
+    part1 = html_content[:split_pos + 4]
+    part2 = html_content[split_pos + 4:]
+
+    # Agregar enlace de navegación entre partes
+    resp1 = tph.create_page(
+        title=f"{title} – Parte 1",
+        html_content=part1 + "<p><em>Continúa en Parte 2...</em></p>",
         author_name=TELEGRAPH_AUTHOR,
     )
-    return f"https://telegra.ph/{response['path']}"
+    url1 = f"https://telegra.ph/{resp1['path']}"
+
+    resp2 = tph.create_page(
+        title=f"{title} – Parte 2",
+        html_content=f'<p><em><a href="{url1}">← Parte 1</a></em></p>' + part2,
+        author_name=TELEGRAPH_AUTHOR,
+    )
+    url2 = f"https://telegra.ph/{resp2['path']}"
+
+    return [url1, url2]
 
 
 # ══════════════════════════════════════════════
@@ -329,7 +389,7 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
 
     for story in stories:
         url = story["url"]
-        title = story.get("title", "Sin título")
+        title = story["title"]
 
         if is_published(url):
             continue
@@ -340,23 +400,32 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         try:
-            telegraph_url = publish_to_telegraph(title, content)
+            urls = publish_to_telegraph(title, content)
+            telegraph_url = urls[0]  # URL principal para el índice
             mark_published(url, title, telegraph_url, pub_date)
             new_count += 1
 
             date_line = f"📅 _{pub_date}_\n\n" if pub_date else ""
-            message = (
-                f"📖 *{title}*\n\n"
-                f"{date_line}"
-                f"🔗 [Leer en Telegraph]({telegraph_url})"
-            )
+
+            if len(urls) == 1:
+                message = (
+                    f"📖 *{title}*\n\n"
+                    f"{date_line}"
+                    f"🔗 [Leer en Telegraph]({urls[0]})"
+                )
+            else:
+                message = (
+                    f"📖 *{title}*\n\n"
+                    f"{date_line}"
+                    f"🔗 [Parte 1]({urls[0]}) | [Parte 2]({urls[1]})"
+                )
+
             await context.bot.send_message(
                 chat_id=CHAT_ID,
                 text=message,
                 parse_mode="Markdown",
             )
             logger.info(f"Publicado: {telegraph_url}")
-
             await update_index(context.bot)
             await asyncio.sleep(3)
 
@@ -382,11 +451,9 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-
 async def cmd_check(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Revisando ahora...")
     await check_and_publish(context)
-
 
 async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
     total = count_published()
@@ -394,7 +461,6 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Relatos publicados: *{total}*",
         parse_mode="Markdown",
     )
-
 
 async def cmd_indice(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 Actualizando índice...")
@@ -406,6 +472,8 @@ async def cmd_indice(update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════
 
 def main():
+    start_health_server()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
