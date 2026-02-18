@@ -156,7 +156,7 @@ async def update_index(bot):
         text = build_index_text()
         # Telegram limita mensajes a 4096 caracteres
         if len(text) > 4096:
-            text = text[:4090] + "\n\\.\\.\\."
+            text = text[:4090] + "\n..."
         message_id = get_index_message_id()
 
         if message_id:
@@ -165,7 +165,7 @@ async def update_index(bot):
                     chat_id=CHAT_ID,
                     message_id=message_id,
                     text=text,
-                    parse_mode="MarkdownV2",
+                    parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
                 logger.info("Índice actualizado.")
