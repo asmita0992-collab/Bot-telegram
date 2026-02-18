@@ -514,6 +514,55 @@ async def cmd_indice(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def cmd_fix_categories(update, context: ContextTypes.DEFAULT_TYPE):
+    """Asigna categoria correcta a relatos que no la tienen, basandose en su URL."""
+    db = get_db()
+
+    # Mapeo URL -> category id
+    url_to_cat = {v["url"].split("/category/")[1].rstrip("/"): k for k, v in CATEGORIES.items()}
+
+    stories = list(db.published.find(
+        {"$or": [{"category": {"$exists": False}}, {"category": ""}, {"category": None}]},
+        {"_id": 1, "url": 1, "category": 1}
+    ))
+
+    await update.message.reply_text(
+        "<b>" + str(len(stories)) + " relatos sin categoría.</b> Corrigiendo...",
+        parse_mode="HTML",
+    )
+
+    fixed = 0
+    for story in stories:
+        url = story.get("url", "")
+        assigned = None
+        for cat_slug, cat_id in url_to_cat.items():
+            if cat_slug in url:
+                assigned = cat_id
+                break
+        # Si no se detecta por URL, intentar por las URLs de categoría conocidas
+        if not assigned:
+            for cat_id, cat in CATEGORIES.items():
+                cat_domain = cat["url"].split("/")[2]
+                if cat_domain in url:
+                    assigned = cat_id
+                    break
+        # Default: gays (los primeros relatos publicados eran de esa categoría)
+        if not assigned:
+            assigned = "gays"
+
+        db.published.update_one(
+            {"_id": story["_id"]},
+            {"$set": {"category": assigned}}
+        )
+        fixed += 1
+
+    await update.message.reply_text(
+        "<b>Listo.</b> " + str(fixed) + " relatos actualizados.",
+        parse_mode="HTML",
+    )
+    await update_index(context.bot)
+
+
 async def cmd_fix_titles(update, context: ContextTypes.DEFAULT_TYPE):
     db = get_db()
     stories = list(db.published.find({}, {"_id": 1, "url": 1, "title": 1}))
@@ -602,6 +651,7 @@ def main():
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("indice", cmd_indice))
+    app.add_handler(CommandHandler("fix_categories", cmd_fix_categories))
     app.add_handler(CommandHandler("fix_titles", cmd_fix_titles))
     app.add_handler(CallbackQueryHandler(callback_category, pattern="^cat_"))
 
