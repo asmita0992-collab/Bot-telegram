@@ -1,6 +1,7 @@
 """
 Bot de Telegram que scrape relatos y los publica en Telegraph automáticamente.
 Usa MongoDB Atlas para persistencia entre reinicios.
+Mantiene un mensaje índice actualizado con todos los relatos publicados.
 """
 
 import asyncio
@@ -13,6 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 from telegraph import Telegraph
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import BadRequest
 from pymongo import MongoClient
 
 # ─────────────────────────────────────────────
@@ -46,6 +48,7 @@ SKIP_TITLES = {
     "0 comentarios", "1 comentario", "sin comentarios",
 }
 
+
 # ══════════════════════════════════════════════
 # MONGODB
 # ══════════════════════════════════════════════
@@ -63,17 +66,89 @@ def is_published(url: str) -> bool:
     db = get_db()
     return db.published.find_one({"url": url}) is not None
 
-def mark_published(url: str, title: str):
+def mark_published(url: str, title: str, telegraph_url: str, pub_date: str):
     db = get_db()
     db.published.update_one(
         {"url": url},
-        {"$set": {"url": url, "title": title, "date": datetime.now()}},
+        {"$set": {
+            "url": url,
+            "title": title,
+            "telegraph_url": telegraph_url,
+            "pub_date": pub_date,
+            "date": datetime.now()
+        }},
         upsert=True,
     )
 
 def count_published() -> int:
     db = get_db()
     return db.published.count_documents({})
+
+def get_all_published() -> list:
+    db = get_db()
+    return list(db.published.find({}, {"_id": 0, "title": 1, "telegraph_url": 1, "pub_date": 1}).sort("date", 1))
+
+def get_index_message_id() -> int | None:
+    db = get_db()
+    doc = db.config.find_one({"key": "index_message_id"})
+    return doc["value"] if doc else None
+
+def set_index_message_id(message_id: int):
+    db = get_db()
+    db.config.update_one(
+        {"key": "index_message_id"},
+        {"$set": {"key": "index_message_id", "value": message_id}},
+        upsert=True,
+    )
+
+
+# ══════════════════════════════════════════════
+# ÍNDICE
+# ══════════════════════════════════════════════
+
+def build_index_text() -> str:
+    stories = get_all_published()
+    if not stories:
+        return "📚 *Índice de Relatos*\n\n_Aún no hay relatos publicados._"
+
+    lines = ["📚 *Índice de Relatos*\n"]
+    for i, story in enumerate(stories, 1):
+        title = story["title"]
+        url = story["telegraph_url"]
+        pub_date = story.get("pub_date", "")
+        date_str = f" _({pub_date})_" if pub_date else ""
+        lines.append(f"{i}\\. [{title}]({url}){date_str}")
+
+    lines.append(f"\n_Total: {len(stories)} relatos_")
+    return "\n".join(lines)
+
+
+async def update_index(bot):
+    text = build_index_text()
+    message_id = get_index_message_id()
+
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=CHAT_ID,
+                message_id=message_id,
+                text=text,
+                parse_mode="MarkdownV2",
+                disable_web_page_preview=True,
+            )
+            logger.info("Índice actualizado.")
+            return
+        except BadRequest as e:
+            logger.warning(f"No se pudo editar el índice: {e}. Creando uno nuevo.")
+
+    msg = await bot.send_message(
+        chat_id=CHAT_ID,
+        text=text,
+        parse_mode="MarkdownV2",
+        disable_web_page_preview=True,
+    )
+    set_index_message_id(msg.message_id)
+    logger.info(f"Índice creado con message_id={msg.message_id}")
 
 
 # ══════════════════════════════════════════════
@@ -142,6 +217,33 @@ def get_all_story_links() -> list:
     return all_stories
 
 
+def extract_pub_date(soup: BeautifulSoup) -> str:
+    """Extrae la fecha de publicación original del relato."""
+    # Intentar con etiqueta <time>
+    time_tag = soup.find("time")
+    if time_tag:
+        # Primero intentar el atributo datetime
+        dt = time_tag.get("datetime", "")
+        if dt:
+            try:
+                d = datetime.fromisoformat(dt[:10])
+                return d.strftime("%d/%m/%Y")
+            except Exception:
+                pass
+        # Si no, usar el texto visible
+        text = time_tag.get_text(strip=True)
+        if text:
+            return text
+
+    # Intentar con clases comunes de WordPress
+    for selector in [".entry-date", ".post-date", ".published", ".date", "span.date"]:
+        el = soup.select_one(selector)
+        if el:
+            return el.get_text(strip=True)
+
+    return ""
+
+
 def clean_html_for_telegraph(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -170,23 +272,25 @@ def clean_html_for_telegraph(html: str) -> str:
     return str(soup).encode("utf-8").decode("utf-8")
 
 
-def get_story_content(story_url: str) -> str:
+def get_story_content(story_url: str) -> tuple[str, str]:
+    """Retorna (html_content, pub_date)."""
     try:
         resp = requests.get(story_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         resp.encoding = "utf-8"
     except Exception as e:
         logger.error(f"Error al descargar relato {story_url}: {e}")
-        return ""
+        return "", ""
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    pub_date = extract_pub_date(soup)
 
     for selector in [".entry-content", ".post-content", "article .content", "article"]:
         content = soup.select_one(selector)
         if content:
-            return clean_html_for_telegraph(str(content))
+            return clean_html_for_telegraph(str(content)), pub_date
 
-    return "<p>No se pudo extraer el contenido.</p>"
+    return "<p>No se pudo extraer el contenido.</p>", pub_date
 
 
 # ══════════════════════════════════════════════
@@ -231,19 +335,20 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         logger.info(f"Nuevo relato: {title}")
-        content = get_story_content(url)
+        content, pub_date = get_story_content(url)
         if not content:
             continue
 
         try:
             telegraph_url = publish_to_telegraph(title, content)
-            mark_published(url, title)
+            mark_published(url, title, telegraph_url, pub_date)
             new_count += 1
 
+            date_line = f"📅 _{pub_date}_\n\n" if pub_date else ""
             message = (
                 f"📖 *{title}*\n\n"
-                f"🔗 [Leer en Telegraph]({telegraph_url})\n\n"
-                f"_Publicado el {datetime.now().strftime('%d/%m/%Y %H:%M')}_"
+                f"{date_line}"
+                f"🔗 [Leer en Telegraph]({telegraph_url})"
             )
             await context.bot.send_message(
                 chat_id=CHAT_ID,
@@ -251,6 +356,8 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
             logger.info(f"Publicado: {telegraph_url}")
+
+            await update_index(context.bot)
             await asyncio.sleep(3)
 
         except Exception as e:
@@ -270,7 +377,8 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
         f"📄 Reviso hasta *{MAX_PAGES} páginas* por ciclo.\n"
         "📌 Comandos:\n"
         "• /check — revisar ahora\n"
-        "• /status — relatos publicados",
+        "• /status — relatos publicados\n"
+        "• /indice — actualizar índice",
         parse_mode="Markdown",
     )
 
@@ -288,6 +396,11 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_indice(update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📚 Actualizando índice...")
+    await update_index(context.bot)
+
+
 # ══════════════════════════════════════════════
 # ARRANQUE
 # ══════════════════════════════════════════════
@@ -298,6 +411,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("indice", cmd_indice))
 
     job_queue = app.job_queue
     job_queue.run_repeating(
