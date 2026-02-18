@@ -165,7 +165,7 @@ async def update_index(bot):
                     chat_id=CHAT_ID,
                     message_id=message_id,
                     text=text,
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
                 logger.info("Índice actualizado.")
