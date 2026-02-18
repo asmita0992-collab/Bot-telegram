@@ -351,26 +351,36 @@ def publish_to_telegraph(title: str, html_content: str) -> list:
         )
         return [f"https://telegra.ph/{response['path']}"]
 
-    # Dividir en dos partes por la mitad (respetando párrafos)
-    mid = len(html_content) // 2
-    split_pos = html_content.rfind("</p>", 0, mid)
-    if split_pos == -1:
-        split_pos = mid
+    # Normalizar HTML antes de dividir para evitar tags incompletos
+    from bs4 import BeautifulSoup as BS
+    soup = BS(html_content, "html.parser")
+    paragraphs = soup.find_all(["p", "h3", "h4", "blockquote"])
 
-    part1 = html_content[:split_pos + 4]
-    part2 = html_content[split_pos + 4:]
+    if len(paragraphs) < 2:
+        # No se puede dividir bien, publicar completo truncado
+        truncated = html_content[:MAX_CONTENT_SIZE]
+        response = tph.create_page(
+            title=title,
+            html_content=truncated,
+            author_name=TELEGRAPH_AUTHOR,
+        )
+        return [f"https://telegra.ph/{response['path']}"]
 
-    # Agregar enlace de navegación entre partes
+    # Dividir los párrafos en dos mitades
+    mid = len(paragraphs) // 2
+    part1_html = "".join(str(p) for p in paragraphs[:mid])
+    part2_html = "".join(str(p) for p in paragraphs[mid:])
+
     resp1 = tph.create_page(
         title=f"{title} – Parte 1",
-        html_content=part1 + "<p><em>Continúa en Parte 2...</em></p>",
+        html_content=part1_html + "<p><em>Continúa en Parte 2...</em></p>",
         author_name=TELEGRAPH_AUTHOR,
     )
     url1 = f"https://telegra.ph/{resp1['path']}"
 
     resp2 = tph.create_page(
         title=f"{title} – Parte 2",
-        html_content=f'<p><em><a href="{url1}">← Parte 1</a></em></p>' + part2,
+        html_content=f'<p><em><a href="{url1}">← Parte 1</a></em></p>' + part2_html,
         author_name=TELEGRAPH_AUTHOR,
     )
     url2 = f"https://telegra.ph/{resp2['path']}"
