@@ -323,20 +323,35 @@ def clean_html_for_telegraph(html: str) -> str:
 
 
 def get_story_content(story_url: str) -> tuple:
+    """Retorna (html_content, pub_date, real_title)"""
     try:
         resp = requests.get(story_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         resp.encoding = "utf-8"
     except Exception as e:
         logger.error(f"Error descargando {story_url}: {e}")
-        return "", ""
+        return "", "", ""
     soup = BeautifulSoup(resp.text, "html.parser")
     pub_date = extract_pub_date(soup)
+
+    # Obtener título real de la página
+    real_title = ""
+    for selector in [".entry-title", "h1.post-title", "h1", "title"]:
+        el = soup.select_one(selector)
+        if el:
+            real_title = el.get_text(strip=True)
+            # Limpiar sufijos típicos de WordPress como " – Nombre del Sitio"
+            for sep in [" – ", " | ", " - "]:
+                if sep in real_title:
+                    real_title = real_title.split(sep)[0].strip()
+            if real_title:
+                break
+
     for selector in [".entry-content", ".post-content", "article .content", "article"]:
         content = soup.select_one(selector)
         if content:
-            return clean_html_for_telegraph(str(content)), pub_date
-    return "<p>No se pudo extraer el contenido.</p>", pub_date
+            return clean_html_for_telegraph(str(content)), pub_date, real_title
+    return "<p>No se pudo extraer el contenido.</p>", pub_date, real_title
 
 
 # ══════════════════════════════════════════════
@@ -411,9 +426,14 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             logger.info(f"  Nuevo: {title}")
-            content, pub_date = get_story_content(url)
+            content, pub_date, real_title = get_story_content(url)
             if not content:
                 continue
+
+            # Usar el título real de la página si está disponible
+            if real_title:
+                logger.info(f"  Título original: {real_title}")
+                title = real_title
 
             try:
                 urls = publish_to_telegraph(title, content)
@@ -439,7 +459,17 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(3)
 
             except Exception as e:
-                logger.error(f"  Error publicando '{title}': {e}")
+                error_str = str(e)
+                logger.error(f"  Error publicando '{title}': {error_str}")
+                # Si Telegraph pide esperar, respetar el tiempo y detener el ciclo
+                if "FLOOD_WAIT" in error_str:
+                    try:
+                        wait_seconds = int(error_str.split("FLOOD_WAIT_")[1].split()[0])
+                    except Exception:
+                        wait_seconds = 60
+                    logger.warning(f"  Telegraph flood wait: {wait_seconds}s. Pausando ciclo.")
+                    await asyncio.sleep(min(wait_seconds, 3600))
+                    break  # salir del loop de esta categoría y continuar en el siguiente ciclo
 
         logger.info(f"  {new_count} nuevos en {cat['name']}")
 
@@ -460,7 +490,8 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 Comandos:\n"
         f"• /check — revisar ahora\n"
         f"• /status — estadísticas\n"
-        f"• /indice — mostrar índice",
+        f"• /indice — mostrar índice\n"
+        f"• /fix_titles — corregir títulos",
         parse_mode="HTML",
     )
 
@@ -481,6 +512,75 @@ async def cmd_indice(update, context: ContextTypes.DEFAULT_TYPE):
     await update_index(context.bot)
 
 
+
+
+async def cmd_fix_titles(update, context: ContextTypes.DEFAULT_TYPE):
+    db = get_db()
+    stories = list(db.published.find({}, {"_id": 1, "url": 1, "title": 1}))
+    total = len(stories)
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    await update.message.reply_text(
+        "<b>Actualizando títulos de " + str(total) + " relatos...</b>\n<i>Esto puede tardar varios minutos.</i>",
+        parse_mode="HTML",
+    )
+
+    for i, story in enumerate(stories, 1):
+        url = story.get("url", "")
+        old_title = story.get("title", "")
+        if not url:
+            skipped += 1
+            continue
+
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            real_title = ""
+            for selector in [".entry-title", "h1.post-title", "h1", "title"]:
+                el = soup.select_one(selector)
+                if el:
+                    real_title = el.get_text(strip=True)
+                    for sep in [" \u2013 ", " | ", " - "]:
+                        if sep in real_title:
+                            real_title = real_title.split(sep)[0].strip()
+                    if real_title:
+                        break
+
+            if real_title and real_title != old_title:
+                db.published.update_one(
+                    {"_id": story["_id"]},
+                    {"$set": {"title": real_title}}
+                )
+                updated += 1
+                logger.info("[" + str(i) + "/" + str(total) + "] '" + old_title + "' -> '" + real_title + "'")
+            else:
+                skipped += 1
+
+            if i % 20 == 0:
+                await update.message.reply_text(
+                    "Progreso: " + str(i) + "/" + str(total) + " revisados, " + str(updated) + " actualizados...",
+                )
+
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error("Error actualizando titulo de " + url + ": " + str(e))
+            failed += 1
+
+    await update.message.reply_text(
+        "<b>Listo.</b>\nActualizados: <b>" + str(updated) + "</b>\nSin cambios: <b>" + str(skipped) + "</b>\nErrores: <b>" + str(failed) + "</b>",
+        parse_mode="HTML",
+    )
+
+    if updated > 0:
+        await update_index(context.bot)
+
+
 # ══════════════════════════════════════════════
 # ARRANQUE
 # ══════════════════════════════════════════════
@@ -494,6 +594,7 @@ def main():
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("indice", cmd_indice))
+    app.add_handler(CommandHandler("fix_titles", cmd_fix_titles))
     app.add_handler(CallbackQueryHandler(callback_category, pattern="^cat_"))
 
     app.job_queue.run_repeating(
