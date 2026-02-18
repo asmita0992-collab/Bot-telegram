@@ -20,7 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID          = os.environ["CHAT_ID"]
 TELEGRAPH_AUTHOR = os.getenv("TELEGRAPH_AUTHOR", "Mi Canal")
-BASE_URL         = "https://sexosintabues30.com/relatos-eroticos/dominacion-hombres/"
+BASE_URL         = "https://sexosintabues30.com/category/relatos-eroticos/gays/"
 INTERVAL_HOURS   = int(os.getenv("INTERVAL_HOURS", "6"))
 PUBLISHED_FILE   = "published.json"
 # ─────────────────────────────────────────────
