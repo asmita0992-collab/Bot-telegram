@@ -6,12 +6,12 @@ import asyncio
 import logging
 import json
 import os
+import re
 from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
 from telegraph import Telegraph
-from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─────────────────────────────────────────────
@@ -39,6 +39,12 @@ HEADERS = {
     )
 }
 
+# Palabras que indican que el enlace NO es un relato
+SKIP_TITLES = {
+    "leer más", "leer mas", "comentarios", "comentario",
+    "0 comentarios", "1 comentario", "sin comentarios",
+}
+
 
 # ══════════════════════════════════════════════
 # PERSISTENCIA
@@ -61,6 +67,7 @@ def save_published(published: set):
 # ══════════════════════════════════════════════
 
 def get_story_links(page_url: str) -> list:
+    """Obtiene solo los enlaces reales a relatos (no menús ni botones)."""
     try:
         resp = requests.get(page_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -70,16 +77,70 @@ def get_story_links(page_url: str) -> list:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     stories = []
+    seen_urls = set()
+    domain = BASE_URL.split("/")[2]
 
-    for a in soup.select("article a, h2 a, h3 a, .entry-title a"):
-        href = a.get("href", "")
-        title = a.get_text(strip=True)
-        if href and title and BASE_URL.split("/")[2] in href:
-            if {"title": title, "url": href} not in stories:
-                stories.append({"title": title, "url": href})
+    # Buscamos solo enlaces dentro de títulos de artículos
+    for tag in soup.select("h1 a, h2 a, h3 a, .entry-title a, .post-title a"):
+        href = a_href = tag.get("href", "").strip()
+        title = tag.get_text(strip=True)
 
-    logger.info(f"Encontrados {len(stories)} relatos en la página.")
+        # Filtros de limpieza
+        if not href or not title:
+            continue
+        if domain not in href:
+            continue
+        if href in seen_urls:
+            continue
+        if len(title) < 8:  # títulos muy cortos son basura (autores, números)
+            continue
+        if title.lower() in SKIP_TITLES:
+            continue
+        if re.match(r"^\d+\s+comentario", title.lower()):
+            continue
+        # Evitar URLs de categorías (no son relatos individuales)
+        if "/category/" in href:
+            continue
+
+        seen_urls.add(href)
+        stories.append({"title": title, "url": href})
+
+    logger.info(f"Encontrados {len(stories)} relatos válidos.")
     return stories
+
+
+def clean_html_for_telegraph(html: str) -> str:
+    """Convierte HTML a formato compatible con Telegraph (sin divs)."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Eliminar elementos no deseados
+    for tag in soup.select("script, style, .sharedaddy, .jp-relatedposts, ins, iframe, form, nav"):
+        tag.decompose()
+
+    # Convertir divs a párrafos
+    for div in soup.find_all("div"):
+        div.name = "p"
+
+    # Convertir span a texto plano
+    for span in soup.find_all("span"):
+        span.unwrap()
+
+    # Limpiar atributos innecesarios (Telegraph solo permite ciertos)
+    allowed_tags = {"p", "br", "strong", "em", "b", "i", "a", "ul", "ol", "li",
+                    "h3", "h4", "blockquote", "figure", "figcaption", "img"}
+    for tag in soup.find_all(True):
+        if tag.name not in allowed_tags:
+            tag.unwrap()
+        else:
+            # Solo conservar atributo href en <a> y src en <img>
+            attrs = {}
+            if tag.name == "a" and tag.get("href"):
+                attrs["href"] = tag["href"]
+            if tag.name == "img" and tag.get("src"):
+                attrs["src"] = tag["src"]
+            tag.attrs = attrs
+
+    return str(soup)
 
 
 def get_story_content(story_url: str) -> str:
@@ -95,9 +156,7 @@ def get_story_content(story_url: str) -> str:
     for selector in [".entry-content", ".post-content", "article .content", "article"]:
         content = soup.select_one(selector)
         if content:
-            for tag in content.select("script, style, .sharedaddy, .jp-relatedposts, ins"):
-                tag.decompose()
-            return str(content)
+            return clean_html_for_telegraph(str(content))
 
     return "<p>No se pudo extraer el contenido.</p>"
 
@@ -132,7 +191,6 @@ def publish_to_telegraph(title: str, html_content: str) -> str:
 # ══════════════════════════════════════════════
 
 async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
-    """Revisa el sitio, publica relatos nuevos y notifica en Telegram."""
     logger.info("Iniciando revisión del sitio...")
     published = load_published()
     stories = get_story_links(BASE_URL)
@@ -145,7 +203,7 @@ async def check_and_publish(context: ContextTypes.DEFAULT_TYPE):
         if url in published:
             continue
 
-        logger.info(f"Nuevo relato encontrado: {title}")
+        logger.info(f"Nuevo relato: {title}")
         content = get_story_content(url)
         if not content:
             continue
@@ -214,12 +272,11 @@ def main():
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Scheduler integrado de python-telegram-bot (sin conflictos de event loop)
     job_queue = app.job_queue
     job_queue.run_repeating(
         check_and_publish,
         interval=INTERVAL_HOURS * 3600,
-        first=10,  # primera ejecución 10 segundos después de arrancar
+        first=10,
     )
 
     logger.info(f"Bot iniciado. Revisando cada {INTERVAL_HOURS} horas.")
