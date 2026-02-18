@@ -588,7 +588,15 @@ async def cmd_fix_titles(update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     start_health_server()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_pool_timeout(30)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("check", cmd_check))
@@ -604,7 +612,25 @@ def main():
     )
 
     logger.info(f"Bot iniciado. {len(CATEGORIES)} categorías. Revisando cada {INTERVAL_HOURS}h.")
-    app.run_polling()
+
+    import time
+    from telegram.error import Conflict, NetworkError
+
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            app.run_polling(drop_pending_updates=True)
+            break
+        except Conflict:
+            wait = 15 * (attempt + 1)
+            logger.warning(f"Conflict: otra instancia activa. Esperando {wait}s (intento {attempt+1}/{max_retries})...")
+            time.sleep(wait)
+        except NetworkError as e:
+            logger.warning(f"NetworkError: {e}. Reintentando en 10s...")
+            time.sleep(10)
+        except Exception as e:
+            logger.error(f"Error inesperado: {e}")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
